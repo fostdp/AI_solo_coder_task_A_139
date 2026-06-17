@@ -18,6 +18,16 @@ class WindErosionSimulator:
         self.PARTICLE_SHAPE_FACTOR = 0.8
         self.HARDNESS_CORRECTION = 0.001
         self.MOISTURE_CORRECTION = 0.05
+        
+        # DES湍流模型参数
+        self.DES_CDES = 0.65          # DES常数 (Spalart-Allmaras标准值)
+        self.DES_KAPPA = 0.41         # von Kármán常数
+        self.RANS_LENGTH_RATIO = 0.07 # RANS区长度比例
+        self.CORNER_VORTEX_STRENGTH = 1.8  # 墙角涡流强度放大因子
+        self.REATTACHMENT_LENGTH = 2.5     # 再附着长度比例（墙体高度倍数）
+        self.SEPARATION_ANGLE = 15.0       # 流动分离角（度）
+        self.TURBULENCE_ENHANCEMENT = 2.5  # 湍流区风蚀增强因子
+        self.BOUNDARY_LAYER_THICKNESS = 0.05 # 边界层厚度（墙体高度比例）
 
     def calculate_threshold_friction_velocity(
         self,
@@ -101,15 +111,185 @@ class WindErosionSimulator:
         total_erosion = erosion_per_impact * impact_count
         return total_erosion
 
-    def simulate_two_phase_flow(
+    def calculate_des_length_scale(
+        self,
+        distance_to_wall: float,
+        grid_scale: float,
+        turbulent_kinetic_energy: float
+    ) -> float:
+        """
+        DES长度尺度计算
+        混合RANS-LES长度：取RANS长度和LES长度的较小值
+        L_DES = min(L_RANS, C_DES * Δ)
+        """
+        # RANS长度尺度：基于到壁面距离（Spalart-Allmaras型）
+        l_rans = self.DES_KAPPA * distance_to_wall
+        
+        # LES长度尺度：基于网格尺寸
+        l_les = self.DES_CDES * grid_scale
+        
+        # DES长度取较小值
+        l_des = min(l_rans, l_les)
+        
+        return max(l_des, 1e-6)
+
+    def calculate_turbulent_kinetic_energy(
+        self,
+        wind_speed: float,
+        turbulence_intensity: float = 0.1
+    ) -> float:
+        """
+        湍流动能 (TKE) 计算
+        k = 1.5 * (U * I)^2
+        """
+        return 1.5 * (wind_speed * turbulence_intensity) ** 2
+
+    def calculate_turbulence_dissipation(
+        self,
+        tke: float,
+        length_scale: float
+    ) -> float:
+        """
+        湍流耗散率 ε
+        ε = C_ε * k^(3/2) / L
+        """
+        C_EPSILON = 0.09
+        return C_EPSILON * tke ** 1.5 / length_scale
+
+    def calculate_eddy_viscosity(
+        self,
+        tke: float,
+        length_scale: float
+    ) -> float:
+        """
+        涡粘度计算
+        ν_t = C_μ * k * L
+        """
+        C_MU = 0.09
+        return C_MU * tke ** 0.5 * length_scale
+
+    def identify_separation_zone(
+        self,
+        grid_positions: np.ndarray,
+        wall_geometry: Dict[str, Any]
+    ) -> np.ndarray:
+        """
+        识别流动分离区
+        基于墙体几何和风攻角判断分离泡位置
+        """
+        nx, ny = grid_positions.shape[:2]
+        separation_mask = np.zeros((nx, ny), dtype=bool)
+        
+        wall_height = wall_geometry.get('height', 2.0)
+        wall_width = wall_geometry.get('width', 3.0)
+        wind_angle = wall_geometry.get('wind_angle', 0.0)
+        wind_angle_rad = np.radians(wind_angle)
+        
+        for i in range(nx):
+            for j in range(ny):
+                x = grid_positions[i, j, 0]
+                y = grid_positions[i, j, 1]
+                
+                # 计算到墙体中心的距离
+                dist_to_center = np.sqrt(x**2 + y**2)
+                
+                # 判断是否在墙体背风面（分离区）
+                windward_side = (x * np.sin(wind_angle_rad) + y * np.cos(wind_angle_rad)) < 0
+                
+                # 计算到墙面的距离
+                dist_to_wall = abs(dist_to_center - wall_width / 2)
+                
+                # 分离区：背风面 + 一定距离范围内
+                if windward_side and dist_to_wall < self.REATTACHMENT_LENGTH * wall_height:
+                    separation_mask[i, j] = True
+        
+        return separation_mask
+
+    def calculate_corner_vortex_strength(
+        self,
+        x: float,
+        y: float,
+        corner_position: Tuple[float, float],
+        wall_height: float,
+        wind_speed: float
+    ) -> float:
+        """
+        墙角涡流强度计算
+        基于Rankine涡模型模拟水平涡
+        """
+        dx = x - corner_position[0]
+        dy = y - corner_position[1]
+        dist = np.sqrt(dx**2 + dy**2)
+        
+        # 涡核半径
+        core_radius = self.BOUNDARY_LAYER_THICKNESS * wall_height
+        
+        if dist < core_radius:
+            # 涡核内：刚性旋转
+            strength = self.CORNER_VORTEX_STRENGTH * wind_speed * (dist / core_radius)
+        else:
+            # 涡核外：势涡衰减
+            strength = self.CORNER_VORTEX_STRENGTH * wind_speed * (core_radius / dist)
+        
+        return strength
+
+    def calculate_des_erosion_enhancement(
+        self,
+        distance_to_wall: float,
+        wall_distance_normalized: float,
+        tke: float,
+        wind_speed: float,
+        separation_zone: bool,
+        corner_vortex: bool
+    ) -> float:
+        """
+        基于DES湍流模型的风蚀增强因子
+        考虑：边界层、分离区、墙角涡流三种增强机制
+        """
+        enhancement = 1.0
+        
+        # 边界层风蚀增强（近壁区高剪切）
+        if wall_distance_normalized < self.BOUNDARY_LAYER_THICKNESS:
+            boundary_layer_factor = 1.0 + (1.0 - wall_distance_normalized / self.BOUNDARY_LAYER_THICKNESS)
+            enhancement = max(enhancement, boundary_layer_factor)
+        
+        # 分离区风蚀增强（反向流和涡旋）
+        if separation_zone:
+            # 分离区内湍流强度显著增加
+            separation_factor = 1.0 + self.TURBULENCE_ENHANCEMENT * (tke / (0.5 * wind_speed**2))
+            enhancement = max(enhancement, separation_factor)
+        
+        # 墙角涡流增强（三维涡结构增加颗粒撞击）
+        if corner_vortex:
+            corner_factor = self.CORNER_VORTEX_STRENGTH
+            enhancement = max(enhancement, corner_factor)
+        
+        # DES切换区平滑过渡（RANS→LES）
+        if wall_distance_normalized < self.RANS_LENGTH_RATIO:
+            # RANS区：使用平均风蚀
+            pass
+        else:
+            # LES区：考虑大尺度涡的脉动增强
+            des_blending = min(1.0, (wall_distance_normalized - self.RANS_LENGTH_RATIO) / 0.1)
+            enhancement *= (1.0 + des_blending * 0.3)
+        
+        return enhancement
+
+    def simulate_two_phase_flow_with_des(
         self,
         wind_speed: float,
         wind_direction: float,
         surface_hardness: float,
         soil_moisture: float,
+        wall_geometry: Dict[str, Any],
         duration_hours: float = 1.0,
-        grid_resolution: int = 10
+        grid_resolution: int = 20
     ) -> Dict[str, Any]:
+        """
+        基于DES湍流模型的风沙两相流仿真
+        精确模拟墙角涡流和流动分离区的风蚀分布
+        """
+        # 基础风蚀计算
         u_star = self.calculate_friction_velocity(wind_speed)
         u_star_t = self.calculate_threshold_friction_velocity(self.SAND_DIAMETER)
         sand_transport = self.calculate_sand_transport_rate(u_star, u_star_t, wind_direction)
@@ -127,22 +307,120 @@ class WindErosionSimulator:
             ((4/3) * np.pi * (self.SAND_DIAMETER/2)**3 * self.SAND_DENSITY)
         )
         
-        erosion_depth = self.calculate_erosion_rate_from_impact(
+        base_erosion_depth = self.calculate_erosion_rate_from_impact(
             impact_energy, surface_hardness, soil_moisture, particle_count
         )
         
+        wall_height = wall_geometry.get('height', 2.0)
+        wall_width = wall_geometry.get('width', 3.0)
+        wall_depth = wall_geometry.get('depth', 0.8)
+        
+        # 生成网格位置
+        x_coords = np.linspace(-wall_width, wall_width, grid_resolution)
+        y_coords = np.linspace(-wall_depth, wall_depth, grid_resolution)
+        
+        # 计算网格点位置和到墙体的距离
+        grid_positions = np.zeros((grid_resolution, grid_resolution, 2))
+        wall_distances = np.zeros((grid_resolution, grid_resolution))
+        corner_vortex_strengths = np.zeros((grid_resolution, grid_resolution))
+        
+        for i in range(grid_resolution):
+            for j in range(grid_resolution):
+                x = x_coords[i]
+                y = y_coords[j]
+                grid_positions[i, j, 0] = x
+                grid_positions[i, j, 1] = y
+                
+                # 计算到墙面的最短距离
+                # 考虑矩形墙体的四个边
+                dx = max(0, abs(x) - wall_width / 2)
+                dy = max(0, abs(y) - wall_depth / 2)
+                dist_to_wall = np.sqrt(dx**2 + dy**2)
+                wall_distances[i, j] = dist_to_wall
+                
+                # 计算墙角涡流强度（四个角）
+                corners = [
+                    (wall_width/2, wall_depth/2),
+                    (wall_width/2, -wall_depth/2),
+                    (-wall_width/2, wall_depth/2),
+                    (-wall_width/2, -wall_depth/2)
+                ]
+                
+                max_corner_strength = 0.0
+                for corner in corners:
+                    cs = self.calculate_corner_vortex_strength(
+                        x, y, corner, wall_height, wind_speed
+                    )
+                    max_corner_strength = max(max_corner_strength, cs)
+                corner_vortex_strengths[i, j] = max_corner_strength
+        
+        # 识别分离区
+        wall_geom = {
+            'height': wall_height,
+            'width': wall_width,
+            'wind_angle': wind_direction
+        }
+        separation_mask = self.identify_separation_zone(grid_positions, wall_geom)
+        
+        # 计算湍流动能
+        tke_base = self.calculate_turbulent_kinetic_energy(wind_speed)
+        
+        # 计算风蚀网格（考虑DES增强因子）
+        erosion_grid = np.zeros((grid_resolution, grid_resolution))
+        tke_grid = np.zeros((grid_resolution, grid_resolution))
+        des_regions = np.zeros((grid_resolution, grid_resolution))  # 0:RANS, 1:LES
+        
+        grid_scale = (wall_width * 2) / grid_resolution
+        
+        for i in range(grid_resolution):
+            for j in range(grid_resolution):
+                dist_to_wall = wall_distances[i, j]
+                normalized_dist = dist_to_wall / wall_height
+                
+                # 当地湍流动能（分离区和墙角处增强）
+                local_tke = tke_base
+                if separation_mask[i, j]:
+                    local_tke *= 2.5
+                if corner_vortex_strengths[i, j] > 0.5:
+                    local_tke *= (1.0 + corner_vortex_strengths[i, j] * 0.5)
+                
+                tke_grid[i, j] = local_tke
+                
+                # DES长度尺度
+                des_length = self.calculate_des_length_scale(
+                    dist_to_wall, grid_scale, local_tke
+                )
+                
+                # 判断DES区域（0=RANS, 1=LES）
+                l_rans = self.DES_KAPPA * dist_to_wall
+                l_les = self.DES_CDES * grid_scale
+                des_regions[i, j] = 1.0 if l_les < l_rans else 0.0
+                
+                # 风蚀增强因子
+                in_corner_vortex = corner_vortex_strengths[i, j] > 0.3
+                enhancement = self.calculate_des_erosion_enhancement(
+                    dist_to_wall,
+                    normalized_dist,
+                    local_tke,
+                    wind_speed,
+                    separation_mask[i, j],
+                    in_corner_vortex
+                )
+                
+                # 基础风蚀 + 角度效应
+                angle_effect = np.abs(np.cos(
+                    np.radians(wind_direction) - 
+                    np.arctan2(x_coords[i], y_coords[j])
+                ))
+                
+                # 综合风蚀深度
+                erosion_grid[i, j] = base_erosion_depth * enhancement * (0.3 + 0.7 * angle_effect)
+        
+        # 速度分量
         wind_direction_rad = np.radians(wind_direction)
         velocity_x = wind_speed * np.sin(wind_direction_rad)
         velocity_y = wind_speed * np.cos(wind_direction_rad)
         velocity_z = wind_speed * 0.1
-        
-        grid = np.zeros((grid_resolution, grid_resolution))
-        for i in range(grid_resolution):
-            for j in range(grid_resolution):
-                distance_factor = 1.0 - np.sqrt((i - grid_resolution/2)**2 + (j - grid_resolution/2)**2) / (grid_resolution/2)
-                distance_factor = max(0.1, distance_factor)
-                angle_effect = np.abs(np.cos(np.radians(wind_direction) - np.arctan2(i - grid_resolution/2, j - grid_resolution/2)))
-                grid[i, j] = erosion_depth * distance_factor * (0.5 + 0.5 * angle_effect)
         
         return {
             "friction_velocity": u_star,
@@ -151,15 +429,47 @@ class WindErosionSimulator:
             "wind_energy": wind_energy,
             "particle_impact_energy": impact_energy,
             "particle_impact_count": particle_count,
-            "erosion_depth_mm": erosion_depth * 1000,
+            "erosion_depth_mm": base_erosion_depth * 1000,
+            "max_erosion_depth_mm": np.max(erosion_grid) * 1000,
+            "avg_erosion_depth_mm": np.mean(erosion_grid) * 1000,
             "velocity_components": {
                 "x": velocity_x,
                 "y": velocity_y,
                 "z": velocity_z
             },
-            "erosion_grid": grid.tolist(),
-            "particle_concentration": particle_concentration
+            "erosion_grid": (erosion_grid * 1000).tolist(),
+            "tke_grid": tke_grid.tolist(),
+            "separation_mask": separation_mask.astype(int).tolist(),
+            "des_regions": des_regions.tolist(),
+            "corner_vortex_strengths": corner_vortex_strengths.tolist(),
+            "particle_concentration": particle_concentration,
+            "des_model": {
+                "c_des": self.DES_CDES,
+                "rans_length_ratio": self.RANS_LENGTH_RATIO,
+                "corner_vortex_strength": self.CORNER_VORTEX_STRENGTH,
+                "turbulence_enhancement": self.TURBULENCE_ENHANCEMENT
+            }
         }
+
+    def simulate_two_phase_flow(
+        self,
+        wind_speed: float,
+        wind_direction: float,
+        surface_hardness: float,
+        soil_moisture: float,
+        duration_hours: float = 1.0,
+        grid_resolution: int = 10
+    ) -> Dict[str, Any]:
+        # 使用默认几何调用DES版本（保持向后兼容）
+        default_geometry = {
+            'height': 2.0,
+            'width': 3.0,
+            'depth': 0.8
+        }
+        return self.simulate_two_phase_flow_with_des(
+            wind_speed, wind_direction, surface_hardness, soil_moisture,
+            default_geometry, duration_hours, grid_resolution
+        )
 
     def calculate_long_term_erosion_rate(
         self,
