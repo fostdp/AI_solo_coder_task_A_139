@@ -12,6 +12,7 @@ const AppState = {
 };
 
 let wallViewer = null;
+let erosionPanel = null;
 let windField2D = null;
 let windField3D = null;
 let dataCharts = null;
@@ -25,6 +26,7 @@ async function initApp() {
     try {
         await loadWallSegments();
         initThreeJSViewer();
+        initErosionPanel();
         initWindFieldVisualizer();
         initDataCharts();
         initTabSwitching();
@@ -97,21 +99,47 @@ function initThreeJSViewer() {
     const container = document.getElementById('threejsContainer');
     if (!container) return;
     
-    wallViewer = new Wall3DViewer('threejsContainer');
-    wallViewer.init();
+    wallViewer = new RammedEarth3DViewer('threejsContainer');
     
     AppState.wallSegments.forEach((segment, index) => {
-        wallViewer.addWallSegment(segment.id, segment.name, {
-            x: index * 4 - 14,
-            y: 0,
-            z: 0,
-            width: 3,
-            height: 2 + Math.random() * 1.5,
-            depth: 0.8
-        }, segment.current_erosion_rate || 0);
+        if (wallViewer.wallSegments.length < AppState.wallSegments.length) {
+        }
     });
     
     wallViewer.animate();
+}
+
+function initErosionPanel() {
+    const panelContainer = document.getElementById('simulationResults');
+    const chartsContainer = document.getElementById('erosionTrendChart')?.parentElement;
+    if (!panelContainer) return;
+    
+    erosionPanel = new ErosionPanelController('simulationResults', 'erosionTrendChart');
+    
+    const toggleErosion = document.getElementById('showErosion');
+    if (toggleErosion) {
+        toggleErosion.addEventListener('change', (e) => {
+            wallViewer?.setShowErosion(e.target.checked);
+        });
+    }
+    const toggleWind = document.getElementById('showWindField');
+    if (toggleWind) {
+        toggleWind.addEventListener('change', (e) => {
+            wallViewer?.setShowWindField(e.target.checked);
+        });
+    }
+    const toggleWire = document.getElementById('showWireframe');
+    if (toggleWire) {
+        toggleWire.addEventListener('change', (e) => {
+            wallViewer?.setShowWireframe(e.target.checked);
+        });
+    }
+    const intensitySlider = document.getElementById('erosionIntensity');
+    if (intensitySlider) {
+        intensitySlider.addEventListener('input', (e) => {
+            wallViewer?.setErosionIntensity(parseInt(e.target.value));
+        });
+    }
 }
 
 function initWindFieldVisualizer() {
@@ -198,7 +226,7 @@ function initEventListeners() {
     });
     
     window.addEventListener('resize', () => {
-        if (wallViewer) wallViewer.resize();
+        if (wallViewer) wallViewer.onWindowResize();
         if (windField2D) {
             const container = document.getElementById('windFieldContainer');
             if (container) {
@@ -297,11 +325,11 @@ async function loadSegmentData(segmentId) {
         AppState.sensorData[segmentId] = status;
         updateSegmentStatusDisplay(status);
         
-        if (wallViewer && status.latest_data) {
+        if (wallViewer && status) {
             wallViewer.updateErosionColors(segmentId, status.erosion_rate || 0);
-            wallViewer.updateWindParticles(
-                status.latest_data.wind_speed || 5,
-                status.latest_data.wind_direction || 0
+            wallViewer.setWindParameters(
+                status.avg_wind_speed_24h || 5,
+                180
             );
         }
         

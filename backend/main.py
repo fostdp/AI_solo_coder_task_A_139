@@ -20,6 +20,7 @@ from .routers import (
     statistics
 )
 from .services.mqtt_alert import mqtt_alert_service
+from .adapters import get_adapter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +45,17 @@ async def lifespan(app: FastAPI):
         logger.info("MQTT alert service connected")
     else:
         logger.warning("Failed to connect to MQTT broker - alerts will not be published")
-    
+
+    try:
+        adapter = get_adapter()
+        await adapter.ensure_services()
+        if adapter.local_only:
+            logger.info("Microservice adapter running in local-only mode (in-process)")
+        else:
+            logger.info("Microservice adapter running with Redis Pub/Sub message bus")
+    except Exception as e:
+        logger.error(f"Failed to initialize microservice adapter: {e}")
+
     yield
     
     logger.info("Shutting down application...")
