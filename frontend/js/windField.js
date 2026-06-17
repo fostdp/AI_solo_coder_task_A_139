@@ -1,4 +1,113 @@
 
+class ObjectPool {
+    constructor(createFn, resetFn, initialSize = 100) {
+        this.createFn = createFn;
+        this.resetFn = resetFn;
+        this.pool = [];
+        this.activeCount = 0;
+        
+        for (let i = 0; i < initialSize; i++) {
+            this.pool.push(this.createFn());
+        }
+    }
+
+    acquire() {
+        let obj;
+        if (this.pool.length > 0) {
+            obj = this.pool.pop();
+        } else {
+            obj = this.createFn();
+        }
+        this.activeCount++;
+        return obj;
+    }
+
+    release(obj) {
+        if (this.resetFn) {
+            this.resetFn(obj);
+        }
+        this.pool.push(obj);
+        this.activeCount--;
+    }
+
+    releaseAll(activeObjects) {
+        for (const obj of activeObjects) {
+            this.release(obj);
+        }
+    }
+
+    getPoolSize() {
+        return this.pool.length;
+    }
+
+    getActiveCount() {
+        return this.activeCount;
+    }
+
+    expand(size) {
+        for (let i = 0; i < size; i++) {
+            this.pool.push(this.createFn());
+        }
+    }
+
+    clear() {
+        this.pool = [];
+        this.activeCount = 0;
+    }
+}
+
+class TrailPointPool extends ObjectPool {
+    constructor(initialSize = 5000) {
+        super(
+            () => ({ x: 0, y: 0 }),
+            (p) => { p.x = 0; p.y = 0; },
+            initialSize
+        );
+    }
+}
+
+class ParticlePool extends ObjectPool {
+    constructor(trailPointPool, initialSize = 500) {
+        super(
+            () => ({
+                x: 0,
+                y: 0,
+                vx: 0,
+                vy: 0,
+                life: 0,
+                maxLife: 150,
+                size: 1,
+                trail: [],
+                trailLength: 0
+            }),
+            (p) => {
+                p.x = 0;
+                p.y = 0;
+                p.vx = 0;
+                p.vy = 0;
+                p.life = 0;
+                p.maxLife = 150;
+                p.size = 1;
+                p.trailLength = 0;
+                if (p.trail.length > 0) {
+                    trailPointPool.releaseAll(p.trail);
+                    p.trail = [];
+                }
+            },
+            initialSize
+        );
+        this.trailPointPool = trailPointPool;
+    }
+
+    acquireTrailPoint() {
+        return this.trailPointPool.acquire();
+    }
+
+    releaseTrailPoint(point) {
+        this.trailPointPool.release(point);
+    }
+}
+
 class WindFieldVisualizer {
     constructor(canvasId) {
         this.canvas = document.getElementById(canvasId);
@@ -7,6 +116,7 @@ class WindFieldVisualizer {
         this.height = this.canvas.height;
         this.particles = [];
         this.particleCount = 300;
+        this.maxTrailLength = 20;
         this.windSpeed = 5;
         this.windDirection = 0;
         this.streamlines = [];
@@ -15,22 +125,89 @@ class WindFieldVisualizer {
         this.animationId = null;
         
         this.noiseOffset = Math.random() * 1000;
-        this.initParticles();
+        
+        this._initPools();
+        this._initParticles();
     }
 
-    initParticles() {
+    _initPools() {
+        this.trailPointPool = new TrailPointPool(this.particleCount * this.maxTrailLength * 2);
+        this.particlePool = new ParticlePool(this.trailPointPool, this.particleCount * 2);
+    }
+
+    _initParticles() {
+        for (const p of this.particles) {
+            this.particlePool.release(p);
+        }
         this.particles = [];
+        
         for (let i = 0; i < this.particleCount; i++) {
-            this.particles.push({
-                x: Math.random() * this.width,
-                y: Math.random() * this.height,
-                vx: 0,
-                vy: 0,
-                life: Math.random() * 100 + 50,
-                maxLife: 150,
-                size: Math.random() * 2 + 1,
-                trail: []
-            });
+            const p = this.particlePool.acquire();
+            this._resetParticle(p, true);
+            this.particles.push(p);
+        }
+    }
+
+    _resetParticle(particle, randomPosition = false) {
+        if (randomPosition) {
+            particle.x = Math.random() * this.width;
+            particle.y = Math.random() * this.height;
+        } else {
+            particle.x = -10 + Math.random() * 20;
+            particle.y = Math.random() * this.height;
+        }
+        
+        particle.vx = 0;
+        particle.vy = 0;
+        particle.life = Math.random() * 100 + 50;
+        particle.maxLife = 150;
+        particle.size = Math.random() * 2 + 1;
+        particle.trailLength = 0;
+        
+        for (const tp of particle.trail) {
+            this.trailPointPool.release(tp);
+        }
+        particle.trail = [];
+    }
+
+    _addTrailPoint(particle, x, y) {
+        if (particle.trailLength >= this.maxTrailLength) {
+            const oldest = particle.trail.shift();
+            oldest.x = x;
+            oldest.y = y;
+            particle.trail.push(oldest);
+        } else {
+            const tp = this.trailPointPool.acquire();
+            tp.x = x;
+            tp.y = y;
+            particle.trail.push(tp);
+            particle.trailLength++;
+        }
+    }
+
+    setParticleCount(count) {
+        if (count === this.particleCount) return;
+        
+        const diff = count - this.particleCount;
+        
+        if (diff > 0) {
+            for (let i = 0; i < diff; i++) {
+                const p = this.particlePool.acquire();
+                this._resetParticle(p, true);
+                this.particles.push(p);
+            }
+        } else {
+            for (let i = 0; i < -diff; i++) {
+                const p = this.particles.pop();
+                this.particlePool.release(p);
+            }
+        }
+        
+        this.particleCount = count;
+        
+        const neededTrailPoints = this.particleCount * this.maxTrailLength * 2;
+        if (this.trailPointPool.getPoolSize() < neededTrailPoints / 2) {
+            this.trailPointPool.expand(neededTrailPoints - this.trailPointPool.getPoolSize());
         }
     }
 
@@ -113,24 +290,38 @@ class WindFieldVisualizer {
             particle.vx = wind.x * this.windSpeed * 0.5;
             particle.vy = wind.y * this.windSpeed * 0.5;
             
-            particle.trail.push({ x: particle.x, y: particle.y });
-            if (particle.trail.length > 20) {
-                particle.trail.shift();
-            }
+            this._addTrailPoint(particle, particle.x, particle.y);
             
             particle.x += particle.vx;
             particle.y += particle.vy;
             particle.life--;
             
-            if (particle.x < -10) particle.x = this.width + 10;
-            if (particle.x > this.width + 10) particle.x = -10;
-            if (particle.y < -10) particle.y = this.height + 10;
-            if (particle.y > this.height + 10) particle.y = -10;
+            let needReset = false;
+            if (particle.x < -10) {
+                particle.x = this.width + 10;
+                needReset = true;
+            } else if (particle.x > this.width + 10) {
+                particle.x = -10;
+                needReset = true;
+            }
+            if (particle.y < -10) {
+                particle.y = this.height + 10;
+                needReset = true;
+            } else if (particle.y > this.height + 10) {
+                particle.y = -10;
+                needReset = true;
+            }
             
-            if (particle.life <= 0) {
-                particle.x = Math.random() * this.width;
-                particle.y = Math.random() * this.height;
+            if (particle.life <= 0 || needReset) {
+                if (particle.life <= 0) {
+                    particle.x = Math.random() * this.width;
+                    particle.y = Math.random() * this.height;
+                }
                 particle.life = particle.maxLife;
+                particle.trailLength = 0;
+                for (const tp of particle.trail) {
+                    this.trailPointPool.release(tp);
+                }
                 particle.trail = [];
             }
         }
@@ -141,14 +332,14 @@ class WindFieldVisualizer {
         this.ctx.fillRect(0, 0, this.width, this.height);
         
         for (const particle of this.particles) {
-            if (particle.trail.length < 2) continue;
+            if (particle.trailLength < 2) continue;
             
             const speed = Math.sqrt(particle.vx * particle.vx + particle.vy * particle.vy);
             const alpha = particle.life / particle.maxLife;
             
             this.ctx.beginPath();
             this.ctx.moveTo(particle.trail[0].x, particle.trail[0].y);
-            for (let i = 1; i < particle.trail.length; i++) {
+            for (let i = 1; i < particle.trailLength; i++) {
                 this.ctx.lineTo(particle.trail[i].x, particle.trail[i].y);
             }
             this.ctx.strokeStyle = `hsla(${180 + speed * 10}, 80%, 60%, ${alpha * 0.6})`;
@@ -339,7 +530,30 @@ class WindFieldVisualizer {
         this.height = height;
         this.canvas.width = width;
         this.canvas.height = height;
-        this.initParticles();
+        
+        for (const p of this.particles) {
+            this._resetParticle(p, true);
+        }
+    }
+
+    getMemoryStats() {
+        return {
+            particlePoolSize: this.particlePool.getPoolSize(),
+            activeParticles: this.particleCount,
+            trailPointPoolSize: this.trailPointPool.getPoolSize(),
+            activeTrailPoints: this.particleCount * this.maxTrailLength,
+            totalPoolObjects: this.particlePool.getPoolSize() + this.trailPointPool.getPoolSize()
+        };
+    }
+
+    destroy() {
+        this.stop();
+        for (const p of this.particles) {
+            this.particlePool.release(p);
+        }
+        this.particles = [];
+        this.particlePool.clear();
+        this.trailPointPool.clear();
     }
 }
 
@@ -349,6 +563,78 @@ class WindField3D {
         this.streamlineObjects = [];
         this.particleSystems = [];
         this.windData = null;
+        this.geometryPool = [];
+        this.materialPool = [];
+        this.maxPoolSize = 30;
+    }
+
+    _acquireGeometry(type, ...args) {
+        let geometry = null;
+        
+        for (let i = 0; i < this.geometryPool.length; i++) {
+            if (this.geometryPool[i].type === type) {
+                geometry = this.geometryPool.splice(i, 1)[0].geo;
+                break;
+            }
+        }
+        
+        if (!geometry) {
+            if (type === 'tube') {
+                const [curve, tubularSegments, radius, radialSegments, closed] = args;
+                geometry = new THREE.TubeGeometry(curve, tubularSegments, radius, radialSegments, closed);
+            } else if (type === 'points') {
+                geometry = new THREE.BufferGeometry();
+            }
+        }
+        
+        return geometry;
+    }
+
+    _releaseGeometry(geometry, type) {
+        if (this.geometryPool.length < this.maxPoolSize) {
+            this.geometryPool.push({ geo: geometry, type: type });
+        } else {
+            geometry.dispose();
+        }
+    }
+
+    _acquireMaterial(type) {
+        let material = null;
+        
+        for (let i = 0; i < this.materialPool.length; i++) {
+            if (this.materialPool[i].type === type) {
+                material = this.materialPool.splice(i, 1)[0].mat;
+                break;
+            }
+        }
+        
+        if (!material) {
+            if (type === 'tube') {
+                material = new THREE.MeshBasicMaterial({
+                    vertexColors: true,
+                    transparent: true,
+                    opacity: 0.7
+                });
+            } else if (type === 'points') {
+                material = new THREE.PointsMaterial({
+                    size: 0.15,
+                    vertexColors: true,
+                    transparent: true,
+                    opacity: 0.9,
+                    blending: THREE.AdditiveBlending
+                });
+            }
+        }
+        
+        return material;
+    }
+
+    _releaseMaterial(material, type) {
+        if (this.materialPool.length < this.maxPoolSize) {
+            this.materialPool.push({ mat: material, type: type });
+        } else {
+            material.dispose();
+        }
     }
 
     createStreamlineGeometry(streamline, colorMap = true) {
@@ -371,18 +657,14 @@ class WindField3D {
         }
         
         const curve = new THREE.CatmullRomCurve3(points);
-        const tubeGeometry = new THREE.TubeGeometry(curve, 64, 0.03, 8, false);
+        const geometry = this._acquireGeometry('tube', curve, 64, 0.03, 8, false);
         
         const colorAttribute = new THREE.Float32BufferAttribute(colors, 3);
-        tubeGeometry.setAttribute('color', colorAttribute);
+        geometry.setAttribute('color', colorAttribute);
         
-        const material = new THREE.MeshBasicMaterial({
-            vertexColors: true,
-            transparent: true,
-            opacity: 0.7
-        });
+        const material = this._acquireMaterial('tube');
         
-        return new THREE.Mesh(tubeGeometry, material);
+        return new THREE.Mesh(geometry, material);
     }
 
     createParticleSystem(streamline, particleCount = 20) {
@@ -411,18 +693,12 @@ class WindField3D {
             offsets[i] = Math.random() * streamline.points.length;
         }
         
-        const geometry = new THREE.BufferGeometry();
+        const geometry = this._acquireGeometry('points');
         geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
         geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
         geometry.setAttribute('offset', new THREE.BufferAttribute(offsets, 1));
         
-        const material = new THREE.PointsMaterial({
-            size: 0.15,
-            vertexColors: true,
-            transparent: true,
-            opacity: 0.9,
-            blending: THREE.AdditiveBlending
-        });
+        const material = this._acquireMaterial('points');
         
         return {
             points: new THREE.Points(geometry, material),
@@ -490,16 +766,39 @@ class WindField3D {
     clear() {
         for (const obj of this.streamlineObjects) {
             this.scene.remove(obj);
-            obj.geometry.dispose();
-            obj.material.dispose();
+            this._releaseGeometry(obj.geometry, 'tube');
+            this._releaseMaterial(obj.material, 'tube');
         }
         this.streamlineObjects = [];
         
         for (const sys of this.particleSystems) {
             this.scene.remove(sys.points);
-            sys.points.geometry.dispose();
-            sys.points.material.dispose();
+            this._releaseGeometry(sys.points.geometry, 'points');
+            this._releaseMaterial(sys.points.material, 'points');
         }
         this.particleSystems = [];
+    }
+
+    getPoolStats() {
+        return {
+            geometryPoolSize: this.geometryPool.length,
+            materialPoolSize: this.materialPool.length,
+            activeStreamlines: this.streamlineObjects.length,
+            activeParticleSystems: this.particleSystems.length
+        };
+    }
+
+    destroy() {
+        this.clear();
+        
+        for (const item of this.geometryPool) {
+            item.geo.dispose();
+        }
+        this.geometryPool = [];
+        
+        for (const item of this.materialPool) {
+            item.mat.dispose();
+        }
+        this.materialPool = [];
     }
 }
