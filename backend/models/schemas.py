@@ -76,7 +76,12 @@ class ReinforcementPlanBase(BaseModel):
     cost_per_sqm: float
     construction_difficulty: Optional[int] = None
     durability_years: Optional[float] = None
+    durability_confidence: Optional[float] = None
+    durability_lower_bound: Optional[float] = None
+    durability_upper_bound: Optional[float] = None
     environmental_impact: Optional[float] = None
+    aging_test_data: Optional[List[Dict[str, Any]]] = None
+    acceleration_factors: Optional[Dict[str, Any]] = None
 
 
 class ReinforcementPlanCreate(ReinforcementPlanBase):
@@ -100,13 +105,14 @@ class TOPSISEvaluationRequest(BaseModel):
         default_factory=lambda: {
             "penetration_depth": 0.25,
             "durability_years": 0.25,
-            "cost_per_sqm": 0.25,
-            "construction_difficulty": 0.15,
+            "durability_confidence": 0.10,
+            "cost_per_sqm": 0.20,
+            "construction_difficulty": 0.10,
             "environmental_impact": 0.10
         }
     )
     benefit_criteria: List[str] = Field(
-        default_factory=lambda: ["penetration_depth", "durability_years"]
+        default_factory=lambda: ["penetration_depth", "durability_years", "durability_confidence"]
     )
     cost_criteria: List[str] = Field(
         default_factory=lambda: ["cost_per_sqm", "construction_difficulty", "environmental_impact"]
